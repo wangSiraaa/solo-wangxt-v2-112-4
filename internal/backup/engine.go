@@ -29,6 +29,10 @@ type Failpoints struct {
 	// blob files from the content store before verification runs,
 	// simulating a crash/loss during commit finalization.
 	LoseChunkCount int
+	// DiffStopAfterChecks: stop diff chunk-integrity verification after this
+	// many checks, simulating a crash mid-generation. The report stays
+	// "running" with persisted progress and resumes on the next request.
+	DiffStopAfterChecks int
 }
 
 // Engine ties the manifest and content store together.
@@ -38,7 +42,8 @@ type Engine struct {
 	Pol      chunker.Pol
 	Fail     Failpoints
 
-	mu sync.Mutex // serializes snapshots: scan + commit is one critical section
+	mu     sync.Mutex // serializes snapshots: scan + commit is one critical section
+	diffMu sync.Mutex // serializes diff generation
 }
 
 // NewEngine opens an engine, loading the repository's chunking polynomial

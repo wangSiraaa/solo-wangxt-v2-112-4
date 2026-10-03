@@ -56,6 +56,17 @@ func main() {
 		}
 	}
 
+	// Likewise, a crash mid-diff leaves a "running" report; resume it from
+	// its persisted phase. Snapshots are only read, never modified.
+	if resumed, err := engine.ResumeInterruptedDiffs(); err != nil {
+		log.Printf("startup diff resume: %v", err)
+	} else {
+		for _, d := range resumed {
+			log.Printf("startup diff resume: diff %d (snapshots %d -> %d) -> %s/%s",
+				d.ID, d.BaseID, d.TargetID, d.Status, d.Integrity)
+		}
+	}
+
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
 		log.Fatalf("listen %s: %v", *addr, err)

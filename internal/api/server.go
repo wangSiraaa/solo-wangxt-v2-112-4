@@ -31,6 +31,11 @@ func (s *Server) NewRouter() http.Handler {
 	mux.HandleFunc("GET /v1/snapshots/{id}/errors", s.listErrors)
 	mux.HandleFunc("GET /v1/snapshots/{id}/missing", s.missing)
 	mux.HandleFunc("POST /v1/snapshots/{id}/restore", s.restore)
+	mux.HandleFunc("POST /v1/diffs", s.createDiff)
+	mux.HandleFunc("GET /v1/diffs", s.listDiffs)
+	mux.HandleFunc("GET /v1/diffs/{id}", s.getDiff)
+	mux.HandleFunc("GET /v1/diffs/{id}/items", s.diffItems)
+	mux.HandleFunc("GET /v1/diffs/{id}/missing", s.diffMissing)
 	return mux
 }
 
@@ -347,4 +352,265 @@ func (s *Server) recover(w http.ResponseWriter, r *http.Request) {
 		ids = append(ids, map[string]any{"snapshot_id": r.SnapshotID, "status": r.Status})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"recovered": ids})
+}
+
+// ---------- snapshot diffs ----------
+
+type diffReq struct {
+	BaseID   int64 `json:"base_id"`
+	TargetID int64 `json:"target_id"`
+	// StopAfterChecks is a failpoint for the demo/tests: interrupt chunk
+	// verification after N checks, leaving a resumable "running" report.
+	StopAfterChecks int `json:"stop_after_checks"`
+}
+
+type diffCountsResp struct {
+	Added          int64 `json:"added"`
+	Deleted        int64 `json:"deleted"`
+	ContentChanged int64 `json:"content_changed"`
+	MetaChanged    int64 `json:"meta_changed"`
+	Renamed        int64 `json:"renamed"`
+	Ambiguous      int64 `json:"ambiguous_rename"`
+	Unchanged      int64 `json:"unchanged"`
+}
+
+type diffResp struct {
+	ID           int64          `json:"id"`
+	BaseID       int64          `json:"base_id"`
+	TargetID     int64          `json:"target_id"`
+	Status       string         `json:"status"`
+	Phase        string         `json:"phase"`
+	Integrity    string         `json:"integrity,omitempty"`
+	Progress     diffProgress   `json:"progress"`
+	Counts       diffCountsResp `json:"counts"`
+	ChunksReused int64          `json:"chunks_reused"`
+	ChunksNew    int64          `json:"chunks_new"`
+	Error        string         `json:"error,omitempty"`
+	RequestedAt  time.Time      `json:"requested_at"`
+	StartedAt    *time.Time     `json:"started_at,omitempty"`
+	FinishedAt   *time.Time     `json:"finished_at,omitempty"`
+}
+
+type diffProgress struct {
+	Done  int64 `json:"done"`
+	Total int64 `json:"total"`
+}
+
+func toDiffResp(r repo.DiffReport) diffResp {
+	return diffResp{
+		ID: r.ID, BaseID: r.BaseID, TargetID: r.TargetID,
+		Status: r.Status, Phase: r.Phase, Integrity: r.Integrity,
+		Progress: diffProgress{Done: r.ProgressDone, Total: r.ProgressTotal},
+		Counts: diffCountsResp{
+			Added: r.Added, Deleted: r.Deleted, ContentChanged: r.ContentChanged,
+			MetaChanged: r.MetaChanged, Renamed: r.Renamed, Ambiguous: r.Ambiguous,
+			Unchanged: r.Unchanged,
+		},
+		ChunksReused: r.ChunksReused, ChunksNew: r.ChunksNew,
+		Error: r.Error, RequestedAt: r.RequestedAt,
+		StartedAt: r.StartedAt, FinishedAt: r.FinishedAt,
+	}
+}
+
+func (s *Server) createDiff(w http.ResponseWriter, r *http.Request) {
+	var req diffReq
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeErr(w, http.StatusBadRequest, "bad_json", err.Error(), nil)
+			return
+		}
+	}
+	if req.BaseID <= 0 || req.TargetID <= 0 {
+		writeErr(w, http.StatusBadRequest, "bad_request", "base_id and target_id are required", nil)
+		return
+	}
+	if req.BaseID == req.TargetID {
+		writeErr(w, http.StatusBadRequest, "bad_request", "base_id and target_id must be two different snapshots", nil)
+		return
+	}
+	s.Engine.Fail.DiffStopAfterChecks = req.StopAfterChecks
+	defer func() { s.Engine.Fail.DiffStopAfterChecks = 0 }()
+
+	rep, created, err := s.Engine.CreateDiff(req.BaseID, req.TargetID)
+	if err != nil {
+		if errors.Is(err, repo.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "not_found", "base or target snapshot does not exist", nil)
+			return
+		}
+		var rej *backup.ErrDiffRejected
+		if errors.As(err, &rej) {
+			writeErr(w, http.StatusConflict, "snapshot_not_committed", rej.Error(), nil)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "diff_failed", err.Error(), nil)
+		return
+	}
+	status := http.StatusOK // existing report returned as-is
+	switch {
+	case rep.Status != repo.DiffDone && rep.Status != repo.DiffFailed:
+		status = http.StatusAccepted // interrupted mid-run; resumable
+	case created:
+		status = http.StatusCreated
+	}
+	writeJSON(w, status, toDiffResp(rep))
+}
+
+func (s *Server) listDiffs(w http.ResponseWriter, r *http.Request) {
+	all, err := s.Engine.Manifest.ListDiffReports()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "db", err.Error(), nil)
+		return
+	}
+	out := make([]diffResp, 0, len(all))
+	for _, rep := range all {
+		out = append(out, toDiffResp(rep))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"diffs": out})
+}
+
+func parseDiffID(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_id", "diff id must be an integer", nil)
+		return 0, false
+	}
+	return id, true
+}
+
+// getDiffReportOr404 loads the report for the {id} path value.
+func (s *Server) getDiffReportOr404(w http.ResponseWriter, r *http.Request) (repo.DiffReport, bool) {
+	id, ok := parseDiffID(w, r)
+	if !ok {
+		return repo.DiffReport{}, false
+	}
+	rep, err := s.Engine.Manifest.GetDiffReport(id)
+	if errors.Is(err, repo.ErrDiffNotFound) {
+		writeErr(w, http.StatusNotFound, "not_found", "diff report does not exist", nil)
+		return rep, false
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "db", err.Error(), nil)
+		return rep, false
+	}
+	return rep, true
+}
+
+func (s *Server) getDiff(w http.ResponseWriter, r *http.Request) {
+	rep, ok := s.getDiffReportOr404(w, r)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, toDiffResp(rep))
+}
+
+type diffSideResp struct {
+	Size       int64     `json:"size"`
+	Digest     string    `json:"digest,omitempty"`
+	Mode       int64     `json:"mode"`
+	Mtime      time.Time `json:"mtime"`
+	LinkTarget string    `json:"link_target,omitempty"`
+}
+
+type diffItemResp struct {
+	ChangeType    string        `json:"change_type"`
+	Kind          string        `json:"kind"`
+	RelPath       string        `json:"rel_path"`
+	OldRelPath    string        `json:"old_rel_path,omitempty"`
+	Old           *diffSideResp `json:"old,omitempty"`
+	New           *diffSideResp `json:"new,omitempty"`
+	ChangedFields []string      `json:"changed_fields,omitempty"`
+	ChunksReused  int64         `json:"chunks_reused"`
+	ChunksNew     int64         `json:"chunks_new"`
+	Candidates    []string      `json:"candidates,omitempty"`
+}
+
+func toDiffItemResp(it repo.DiffItem) diffItemResp {
+	out := diffItemResp{
+		ChangeType: it.ChangeType, Kind: it.Kind,
+		RelPath: it.RelPath, OldRelPath: it.OldRelPath,
+		ChangedFields: it.ChangedFields, Candidates: it.Candidates,
+		ChunksReused: it.ChunksReused, ChunksNew: it.ChunksNew,
+	}
+	if it.OldSize >= 0 {
+		out.Old = &diffSideResp{
+			Size: it.OldSize, Mode: it.OldMode,
+			Mtime: time.Unix(0, it.OldMtimeNS).UTC(), LinkTarget: it.OldLinkTarget,
+		}
+		if len(it.OldDigest) > 0 {
+			out.Old.Digest = hex.EncodeToString(it.OldDigest)
+		}
+	}
+	if it.NewSize >= 0 {
+		out.New = &diffSideResp{
+			Size: it.NewSize, Mode: it.NewMode,
+			Mtime: time.Unix(0, it.NewMtimeNS).UTC(), LinkTarget: it.NewLinkTarget,
+		}
+		if len(it.NewDigest) > 0 {
+			out.New.Digest = hex.EncodeToString(it.NewDigest)
+		}
+	}
+	return out
+}
+
+func toSlashPath(p string) string { return p }
+
+var diffChangeTypes = map[string]bool{
+	repo.ChangeAdded: true, repo.ChangeDeleted: true,
+	repo.ChangeContentChanged: true, repo.ChangeMetaChanged: true,
+	repo.ChangeRenamed: true, repo.ChangeAmbiguous: true,
+}
+
+func (s *Server) diffItems(w http.ResponseWriter, r *http.Request) {
+	rep, ok := s.getDiffReportOr404(w, r)
+	if !ok {
+		return
+	}
+	filter := r.URL.Query().Get("type")
+	if filter != "" && !diffChangeTypes[filter] {
+		writeErr(w, http.StatusBadRequest, "bad_request",
+			"unknown change type "+filter, nil)
+		return
+	}
+	items, err := s.Engine.Manifest.DiffItemsOf(rep.ID, filter)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "db", err.Error(), nil)
+		return
+	}
+	out := make([]diffItemResp, 0, len(items))
+	for _, it := range items {
+		out = append(out, toDiffItemResp(it))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"diff_id": rep.ID, "status": rep.Status, "integrity": rep.Integrity, "items": out,
+	})
+}
+
+func (s *Server) diffMissing(w http.ResponseWriter, r *http.Request) {
+	rep, ok := s.getDiffReportOr404(w, r)
+	if !ok {
+		return
+	}
+	missing, err := s.Engine.Manifest.DiffMissingOf(rep.ID)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "db", err.Error(), nil)
+		return
+	}
+	type item struct {
+		SnapshotID  int64  `json:"snapshot_id"`
+		RelPath     string `json:"rel_path"`
+		ChunkDigest string `json:"chunk_digest"`
+		Reason      string `json:"reason"`
+	}
+	out := make([]item, 0, len(missing))
+	for _, dm := range missing {
+		out = append(out, item{
+			SnapshotID:  dm.SnapshotID,
+			RelPath:     dm.RelPath,
+			ChunkDigest: hex.EncodeToString(dm.ChunkDigest),
+			Reason:      dm.Reason,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"diff_id": rep.ID, "status": rep.Status, "integrity": rep.Integrity, "missing": out,
+	})
 }

@@ -120,6 +120,86 @@ CREATE TABLE IF NOT EXISTS meta (
 	key   TEXT PRIMARY KEY,
 	value TEXT NOT NULL
 );
+
+-- Snapshot diff reports. The compare request, the pinned snapshot pair and
+-- the generation state live here, so a repeated request for the same pair
+-- returns the same traceable report and an interrupted run resumes where it
+-- stopped instead of restarting (or touching the snapshots themselves).
+CREATE TABLE IF NOT EXISTS diff_reports (
+	id             INTEGER PRIMARY KEY AUTOINCREMENT,
+	base_id        INTEGER NOT NULL REFERENCES snapshots(id),
+	target_id      INTEGER NOT NULL REFERENCES snapshots(id),
+	status         TEXT    NOT NULL DEFAULT 'pending',  -- pending | running | done | failed
+	phase          TEXT    NOT NULL DEFAULT 'classify', -- classify | verify | finalize | done
+	integrity      TEXT    NOT NULL DEFAULT '',         -- complete | incomplete (once done)
+	progress_done  INTEGER NOT NULL DEFAULT 0,
+	progress_total INTEGER NOT NULL DEFAULT 0,
+	added_count           INTEGER NOT NULL DEFAULT 0,
+	deleted_count         INTEGER NOT NULL DEFAULT 0,
+	content_changed_count INTEGER NOT NULL DEFAULT 0,
+	meta_changed_count    INTEGER NOT NULL DEFAULT 0,
+	renamed_count         INTEGER NOT NULL DEFAULT 0,
+	ambiguous_count       INTEGER NOT NULL DEFAULT 0,
+	unchanged_count       INTEGER NOT NULL DEFAULT 0,
+	chunks_reused  INTEGER NOT NULL DEFAULT 0,
+	chunks_new     INTEGER NOT NULL DEFAULT 0,
+	error          TEXT    NOT NULL DEFAULT '',
+	requested_at   TEXT    NOT NULL,
+	started_at     TEXT,
+	finished_at    TEXT,
+	UNIQUE (base_id, target_id)
+);
+
+-- One classified change per row. One-sided items keep the absent side at
+-- -1/NULL/''. changed_fields and candidates are JSON arrays.
+CREATE TABLE IF NOT EXISTS diff_items (
+	id             INTEGER PRIMARY KEY AUTOINCREMENT,
+	report_id      INTEGER NOT NULL REFERENCES diff_reports(id) ON DELETE CASCADE,
+	change_type    TEXT    NOT NULL, -- added | deleted | content_changed | meta_changed | renamed | ambiguous_rename
+	kind           TEXT    NOT NULL, -- file | dir | symlink
+	rel_path       TEXT    NOT NULL,
+	old_rel_path   TEXT    NOT NULL DEFAULT '',
+	old_size       INTEGER NOT NULL DEFAULT -1,
+	new_size       INTEGER NOT NULL DEFAULT -1,
+	old_digest     BLOB,
+	new_digest     BLOB,
+	old_mode       INTEGER NOT NULL DEFAULT -1,
+	new_mode       INTEGER NOT NULL DEFAULT -1,
+	old_mtime_ns   INTEGER NOT NULL DEFAULT 0,
+	new_mtime_ns   INTEGER NOT NULL DEFAULT 0,
+	old_link_target TEXT   NOT NULL DEFAULT '',
+	new_link_target TEXT   NOT NULL DEFAULT '',
+	changed_fields TEXT    NOT NULL DEFAULT '[]',
+	candidates     TEXT    NOT NULL DEFAULT '[]',
+	chunks_reused  INTEGER NOT NULL DEFAULT 0,
+	chunks_new     INTEGER NOT NULL DEFAULT 0,
+	item_order     INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_diff_items ON diff_items(report_id, item_order);
+
+-- Per-chunk integrity verdicts gathered while generating a report. Chunks
+-- are immutable, so a recorded check stays valid: an interrupted verify
+-- phase resumes after the last recorded check.
+CREATE TABLE IF NOT EXISTS diff_chunk_checks (
+	report_id    INTEGER NOT NULL REFERENCES diff_reports(id) ON DELETE CASCADE,
+	chunk_digest BLOB    NOT NULL,
+	length       INTEGER NOT NULL,
+	ok           INTEGER NOT NULL,
+	reason       TEXT    NOT NULL DEFAULT '',
+	PRIMARY KEY (report_id, chunk_digest)
+);
+
+-- Paths whose chunks failed integrity during compare. A report with any row
+-- here is "incomplete": those files must not be read as safely unchanged.
+CREATE TABLE IF NOT EXISTS diff_missing (
+	id           INTEGER PRIMARY KEY AUTOINCREMENT,
+	report_id    INTEGER NOT NULL REFERENCES diff_reports(id) ON DELETE CASCADE,
+	snapshot_id  INTEGER NOT NULL,
+	rel_path     TEXT    NOT NULL,
+	chunk_digest BLOB    NOT NULL,
+	reason       TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_diff_missing ON diff_missing(report_id);
 `
 
 func (m *Manifest) migrate() error {
