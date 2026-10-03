@@ -6,8 +6,10 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"incbackup/internal/backup"
@@ -17,6 +19,23 @@ import (
 // Server wires the engine to HTTP.
 type Server struct {
 	Engine *backup.Engine
+	Diff   *backup.DiffService
+
+	diffOnce sync.Once
+	diffSvc  *backup.DiffService
+}
+
+// diffService returns the configured diff service, lazily creating one bound
+// to the engine so existing callers that only set Engine keep working.
+func (s *Server) diffService() *backup.DiffService {
+	s.diffOnce.Do(func() {
+		if s.Diff != nil {
+			s.diffSvc = s.Diff
+		} else {
+			s.diffSvc = backup.NewDiffService(s.Engine)
+		}
+	})
+	return s.diffSvc
 }
 
 // NewRouter builds the mux.
@@ -31,6 +50,11 @@ func (s *Server) NewRouter() http.Handler {
 	mux.HandleFunc("GET /v1/snapshots/{id}/errors", s.listErrors)
 	mux.HandleFunc("GET /v1/snapshots/{id}/missing", s.missing)
 	mux.HandleFunc("POST /v1/snapshots/{id}/restore", s.restore)
+	mux.HandleFunc("POST /v1/diffs", s.createDiff)
+	mux.HandleFunc("GET /v1/diffs", s.listDiffs)
+	mux.HandleFunc("GET /v1/diffs/{id}", s.getDiff)
+	mux.HandleFunc("GET /v1/diffs/{id}/items", s.diffItems)
+	mux.HandleFunc("GET /v1/diffs/{id}/problems", s.diffProblems)
 	return mux
 }
 
@@ -347,4 +371,251 @@ func (s *Server) recover(w http.ResponseWriter, r *http.Request) {
 		ids = append(ids, map[string]any{"snapshot_id": r.SnapshotID, "status": r.Status})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"recovered": ids})
+}
+
+// ---------- snapshot diff reports ----------
+
+type diffReq struct {
+	BaseSnapshotID   int64 `json:"base_snapshot_id"`
+	TargetSnapshotID int64 `json:"target_snapshot_id"`
+}
+
+func diffJobJSON(j repo.DiffJob) map[string]any {
+	out := map[string]any{
+		"id":                 j.ID,
+		"base_snapshot_id":   j.BaseSnapshotID,
+		"target_snapshot_id": j.TargetSnapshot,
+		"status":             j.Status,
+		"complete":           j.Complete,
+		"chunks_total":       j.ChunksTotal,
+		"chunks_checked":     j.ChunksChecked,
+		"chunks_reused":      j.ChunksReused,
+		"chunks_new":         j.ChunksNew,
+		"chunks_missing":     j.ChunksMissing,
+		"chunks_mismatch":    j.ChunksMismatch,
+		"affected_files":     j.AffectedFiles,
+		"created_at":         j.CreatedAt,
+		"updated_at":         j.UpdatedAt,
+		"incomplete":         j.Complete && (j.ChunksMissing > 0 || j.ChunksMismatch > 0),
+	}
+	if j.Error != "" {
+		out["error"] = j.Error
+	}
+	if j.StartedAt != nil {
+		out["started_at"] = j.StartedAt
+	}
+	if j.CompleteAt != nil {
+		out["complete_at"] = j.CompleteAt
+	}
+	return out
+}
+
+func (s *Server) createDiff(w http.ResponseWriter, r *http.Request) {
+	var req diffReq
+	if r.Body != nil {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeErr(w, http.StatusBadRequest, "bad_json", err.Error(), nil)
+			return
+		}
+	}
+	if req.BaseSnapshotID <= 0 || req.TargetSnapshotID <= 0 {
+		writeErr(w, http.StatusBadRequest, "bad_request",
+			"base_snapshot_id and target_snapshot_id are required", nil)
+		return
+	}
+	j, err := s.diffService().EnsureDiff(req.BaseSnapshotID, req.TargetSnapshotID)
+	if err != nil {
+		var notCommitted *backup.ErrDiffNotCommitted
+		if errors.As(err, &notCommitted) {
+			writeErr(w, http.StatusConflict, "snapshot_not_committed", err.Error(), map[string]any{
+				"snapshot_id": notCommitted.SnapshotID,
+				"status":      notCommitted.Status,
+			})
+			return
+		}
+		if errors.Is(err, repo.ErrNotFound) {
+			writeErr(w, http.StatusNotFound, "not_found", err.Error(), nil)
+			return
+		}
+		writeErr(w, http.StatusInternalServerError, "diff_failed", err.Error(), nil)
+		return
+	}
+	// Repeated request: same persisted, traceable report.
+	writeJSON(w, http.StatusAccepted, diffJobJSON(j))
+}
+
+func (s *Server) listDiffs(w http.ResponseWriter, r *http.Request) {
+	jobs, err := s.Engine.Manifest.ListDiffJobs()
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "db", err.Error(), nil)
+		return
+	}
+	out := make([]map[string]any, 0, len(jobs))
+	for _, j := range jobs {
+		out = append(out, diffJobJSON(j))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"diffs": out})
+}
+
+func parseDiffID(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeErr(w, http.StatusBadRequest, "bad_id", "diff id must be an integer", nil)
+		return 0, false
+	}
+	return id, true
+}
+
+func (s *Server) loadDiff(w http.ResponseWriter, id int64) (repo.DiffJob, bool) {
+	j, err := s.Engine.Manifest.GetDiffJob(id)
+	if errors.Is(err, repo.ErrNotFound) {
+		writeErr(w, http.StatusNotFound, "not_found", "diff report does not exist", nil)
+		return j, false
+	}
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "db", err.Error(), nil)
+		return j, false
+	}
+	return j, true
+}
+
+func (s *Server) getDiff(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseDiffID(w, r)
+	if !ok {
+		return
+	}
+	j, ok := s.loadDiff(w, id)
+	if !ok {
+		return
+	}
+	resp := diffJobJSON(j)
+	if j.Complete {
+		counts, err := s.Engine.Manifest.DiffItemCounts(id)
+		if err != nil {
+			writeErr(w, http.StatusInternalServerError, "db", err.Error(), nil)
+			return
+		}
+		resp["counts"] = map[string]any{
+			"added":            counts.Added,
+			"deleted":          counts.Deleted,
+			"changed":          counts.Changed,
+			"metadata_changed": counts.Metadata,
+			"unchanged":        counts.Unchanged,
+			"renamed":          counts.Renamed,
+			"ambiguous":        counts.Ambiguous,
+			"unverified":       counts.Unverified,
+		}
+	}
+	writeJSON(w, http.StatusOK, resp)
+}
+
+func (s *Server) diffItems(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseDiffID(w, r)
+	if !ok {
+		return
+	}
+	j, ok := s.loadDiff(w, id)
+	if !ok {
+		return
+	}
+	q := r.URL.Query()
+	filter := repo.DiffItemFilter{ChangeType: q.Get("change_type")}
+	limit, offset := 0, 0
+	if v := q.Get("limit"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	if v := q.Get("offset"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			offset = n
+		}
+	}
+	items, total, err := s.Engine.Manifest.ListDiffItems(id, filter, limit, offset)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "db", err.Error(), nil)
+		return
+	}
+	type itemResp struct {
+		BasePath      string          `json:"base_path,omitempty"`
+		TargetPath    string          `json:"target_path,omitempty"`
+		Kind          string          `json:"kind"`
+		ChangeType    string          `json:"change_type"`
+		ChangedFields string          `json:"changed_fields,omitempty"`
+		FileDigest    string          `json:"file_digest,omitempty"`
+		ChunksReused  int64           `json:"chunks_reused"`
+		ChunksNew     int64           `json:"chunks_new"`
+		Integrity     string          `json:"integrity"`
+		Detail        json.RawMessage `json:"detail"`
+	}
+	out := make([]itemResp, 0, len(items))
+	for _, it := range items {
+		detail := json.RawMessage("null")
+		if it.Detail != "" {
+			detail = json.RawMessage(it.Detail)
+		}
+		out = append(out, itemResp{
+			BasePath: it.BasePath, TargetPath: it.TargetPath, Kind: it.EntryKind,
+			ChangeType: it.ChangeType, ChangedFields: it.ChangedFields,
+			FileDigest: it.FileDigest, ChunksReused: it.ChunksReused,
+			ChunksNew: it.ChunksNew, Integrity: it.Integrity, Detail: detail,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"diff_id":    id,
+		"status":     j.Status,
+		"complete":   j.Complete,
+		"incomplete": j.Complete && (j.ChunksMissing > 0 || j.ChunksMismatch > 0),
+		"total":      total,
+		"limit":      limit,
+		"offset":     offset,
+		"items":      out,
+	})
+}
+
+func (s *Server) diffProblems(w http.ResponseWriter, r *http.Request) {
+	id, ok := parseDiffID(w, r)
+	if !ok {
+		return
+	}
+	j, ok := s.loadDiff(w, id)
+	if !ok {
+		return
+	}
+	probs, err := s.Engine.Manifest.ListDiffProblems(id)
+	if err != nil {
+		writeErr(w, http.StatusInternalServerError, "db", err.Error(), nil)
+		return
+	}
+	type probResp struct {
+		SnapshotID     int64  `json:"snapshot_id"`
+		RelPath        string `json:"rel_path"`
+		Kind           string `json:"kind"`
+		ChunkDigest    string `json:"chunk_digest"`
+		DeclaredLength int64  `json:"declared_length"`
+		ActualDigest   string `json:"actual_digest,omitempty"`
+		Reason         string `json:"reason"`
+	}
+	out := make([]probResp, 0, len(probs))
+	seen := map[string]bool{}
+	for _, p := range probs {
+		out = append(out, probResp{
+			SnapshotID: p.SnapshotID, RelPath: p.RelPath, Kind: p.Kind,
+			ChunkDigest: p.ChunkDigest, DeclaredLength: p.DeclaredLength,
+			ActualDigest: p.ActualDigest, Reason: p.Reason,
+		})
+		seen[p.RelPath] = true
+	}
+	paths := make([]string, 0, len(seen))
+	for p := range seen {
+		paths = append(paths, p)
+	}
+	sort.Strings(paths)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"diff_id":        id,
+		"status":         j.Status,
+		"incomplete":     j.Complete && (j.ChunksMissing > 0 || j.ChunksMismatch > 0),
+		"affected_paths": paths,
+		"problems":       out,
+	})
 }

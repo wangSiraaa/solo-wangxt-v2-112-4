@@ -274,6 +274,140 @@ func main() {
 	fmt.Printf("  重启后: 快照 %d status=%s\n", pendID, si["status"])
 	check("重启恢复把 pending 快照验证后提交为 committed", si["status"] == "committed")
 
+	// ---- 8. persisted snapshot diff reports -------------------------------
+	section(8, "快照差异报告：内容/元数据/重命名/歧义/块复用，持久化且可追溯")
+	diffSrc := filepath.Join(work, "diffsrc")
+	must(os.MkdirAll(diffSrc, 0o755))
+	diffLog := make([]byte, 0, 160*1024)
+	for i := 0; i < 160*1024; i++ {
+		diffLog = append(diffLog, byte("0123456789ABCDEF\n"[i%17]))
+	}
+	must(os.WriteFile(filepath.Join(diffSrc, "big.log"), diffLog, 0o644))
+	must(os.WriteFile(filepath.Join(diffSrc, "old-name.txt"), []byte(strings.Repeat("unique rename body\n", 400)), 0o644))
+	dupBody := strings.Repeat("duplicated payload\n", 400)
+	must(os.WriteFile(filepath.Join(diffSrc, "dup.bin"), []byte(dupBody), 0o644))
+	must(os.WriteFile(filepath.Join(diffSrc, "meta.sh"), []byte("#!/bin/sh\n"), 0o644))
+	must(os.WriteFile(filepath.Join(diffSrc, "t1"), []byte("target-one\n"), 0o600))
+	must(os.WriteFile(filepath.Join(diffSrc, "t2"), []byte("target-two\n"), 0o600))
+	must(os.Symlink("t1", filepath.Join(diffSrc, "link")))
+	d1 := post(srv.URL+"/v1/snapshots", map[string]any{"root": diffSrc, "message": "diff base"})
+	diffID1 := int64(d1["snapshot_id"].(float64))
+	check("基线差异快照 committed", d1["status"] == "committed")
+
+	// apply every category of change
+	copy(diffLog[80*1024:80*1024+8], []byte("PATCHED!"))
+	must(os.WriteFile(filepath.Join(diffSrc, "big.log"), diffLog, 0o644))
+	must(os.Rename(filepath.Join(diffSrc, "old-name.txt"), filepath.Join(diffSrc, "new-name.txt")))
+	must(os.WriteFile(filepath.Join(diffSrc, "dup-copy.bin"), []byte(dupBody), 0o644)) // same digest -> ambiguous
+	must(os.Chmod(filepath.Join(diffSrc, "meta.sh"), 0o755))                           // mode only
+	must(os.Remove(filepath.Join(diffSrc, "link")))
+	must(os.Symlink("t2", filepath.Join(diffSrc, "link"))) // link target only, never followed
+	d2 := post(srv.URL+"/v1/snapshots", map[string]any{"root": diffSrc, "message": "diff target"})
+	diffID2 := int64(d2["snapshot_id"].(float64))
+
+	code, body = raw("POST", srv.URL+"/v1/diffs", map[string]any{
+		"base_snapshot_id": diffID1, "target_snapshot_id": diffID2,
+	})
+	fmt.Printf("  POST /v1/diffs -> HTTP %d, diff %v status=%v\n", code, body["id"], body["status"])
+	check("创建比较返回 202", code == http.StatusAccepted)
+	diffID := int64(body["id"].(float64))
+
+	// identical request returns the SAME persisted report
+	dup := post(srv.URL+"/v1/diffs", map[string]any{
+		"base_snapshot_id": diffID1, "target_snapshot_id": diffID2,
+	})
+	check("重复请求返回同一份可追溯报告（相同 diff id）", int64(dup["id"].(float64)) == diffID)
+
+	rep := waitDiff(srv.URL, diffID)
+	fmt.Printf("  报告 status=%v incomplete=%v 复用块=%v 新块=%v 校验=%v/%v\n",
+		rep["status"], rep["incomplete"], rep["chunks_reused"], rep["chunks_new"],
+		rep["chunks_checked"], rep["chunks_total"])
+	check("比较完成且健康（incomplete=false）", rep["status"] == "complete" && rep["incomplete"] == false)
+
+	items, _ := get(srv.URL + fmt.Sprintf("/v1/diffs/%d/items", diffID))["items"].([]any)
+	find := func(pred func(map[string]any) bool) map[string]any {
+		for _, x := range items {
+			m := x.(map[string]any)
+			if pred(m) {
+				return m
+			}
+		}
+		return nil
+	}
+	big := find(func(m map[string]any) bool { return m["target_path"] == "big.log" })
+	fmt.Printf("  big.log: %s 复用块=%v 新块=%v 字段=%v\n",
+		big["change_type"], big["chunks_reused"], big["chunks_new"], big["changed_fields"])
+	check("①中间改少量字节 => changed 且新块=1、其余块复用",
+		big["change_type"] == "changed" &&
+			big["chunks_new"].(float64) == 1 && big["chunks_reused"].(float64) > 0)
+
+	ren := find(func(m map[string]any) bool { return m["change_type"] == "renamed" })
+	fmt.Printf("  renamed: %v -> %v\n", ren["base_path"], ren["target_path"])
+	check("②单文件改名被识别为 renamed（old-name.txt -> new-name.txt）",
+		ren["base_path"] == "old-name.txt" && ren["target_path"] == "new-name.txt")
+	amb := find(func(m map[string]any) bool { return m["change_type"] == "ambiguous" })
+	fmt.Printf("  ambiguous 示例: %v detail=%s\n", amb["target_path"], amb["detail"])
+	check("②两个相同内容文件只标 ambiguous，绝不虚构 rename",
+		amb != nil && ren["base_path"] != amb["base_path"])
+
+	meta := find(func(m map[string]any) bool { return m["target_path"] == "meta.sh" })
+	link := find(func(m map[string]any) bool { return m["target_path"] == "link" })
+	t1 := find(func(m map[string]any) bool { return m["target_path"] == "t1" })
+	check("③仅改权限 => metadata_changed(mode)",
+		meta["change_type"] == "metadata_changed" &&
+			strings.Contains(meta["changed_fields"].(string), "mode"))
+	check("③仅改符号链接目标 => metadata_changed(link_target)，且不跟随链接",
+		link["change_type"] == "metadata_changed" &&
+			strings.Contains(link["changed_fields"].(string), "link_target") &&
+			t1["change_type"] == "unchanged")
+
+	// pending snapshot must be rejected
+	pendDiff := post(srv.URL+"/v1/snapshots", map[string]any{
+		"root": diffSrc, "message": "diff pending", "finish": false,
+	})
+	pendDiffID := int64(pendDiff["snapshot_id"].(float64))
+	code, body = raw("POST", srv.URL+"/v1/diffs", map[string]any{
+		"base_snapshot_id": diffID2, "target_snapshot_id": pendDiffID,
+	})
+	fmt.Printf("  对 pending 快照发起比较 -> HTTP %d: %s\n", code, body["error"])
+	check("④pending/failed 快照被拒绝（409 snapshot_not_committed）",
+		code == http.StatusConflict && body["error"] == "snapshot_not_committed")
+
+	// storage rot discovered during comparison -> incomplete report, original
+	// snapshots stay committed and the intact one stays restorable
+	must(os.WriteFile(filepath.Join(diffSrc, "rot.bin"),
+		[]byte(strings.Repeat("brand-new-rot-body-", 1200)), 0o644))
+	d3 := post(srv.URL+"/v1/snapshots", map[string]any{"root": diffSrc, "message": "diff rot"})
+	rotSnapID := int64(d3["snapshot_id"].(float64))
+	victim := newestBlob(filepath.Join(repoDir, "chunks"))
+	must(os.Remove(victim)) // simulate storage rot after commit
+	fmt.Printf("  删掉已提交快照引用的块: %s\n", filepath.Base(victim))
+	rotCode, rotBody := raw("POST", srv.URL+"/v1/diffs", map[string]any{
+		"base_snapshot_id": diffID2, "target_snapshot_id": rotSnapID,
+	})
+	check("损坏情况下比较请求仍被接受", rotCode == http.StatusAccepted)
+	rotRep := waitDiff(srv.URL, int64(rotBody["id"].(float64)))
+	fmt.Printf("  报告 status=%v incomplete=%v missing=%v affected_files=%v\n",
+		rotRep["status"], rotRep["incomplete"], rotRep["chunks_missing"], rotRep["affected_files"])
+	check("④发现缺块 => complete 但 incomplete=true，并统计缺块数",
+		rotRep["status"] == "complete" && rotRep["incomplete"] == true &&
+			rotRep["chunks_missing"].(float64) >= 1)
+	probDoc := get(srv.URL + fmt.Sprintf("/v1/diffs/%d/problems", int64(rotBody["id"].(float64))))
+	probList := probDoc["problems"].([]any)
+	fmt.Printf("  不完整报告列出 %d 条缺块引用，受影响路径: %v\n",
+		len(probList), probDoc["affected_paths"])
+	check("缺块被归到具体文件路径而不是笼统说未变更",
+		len(probList) >= 1 && probList[0].(map[string]any)["rel_path"] != "")
+	for _, id := range []int64{diffID2, rotSnapID} {
+		s := get(srv.URL + fmt.Sprintf("/v1/snapshots/%d", id))
+		check(fmt.Sprintf("④比较不改动原快照 %d 的状态（仍 committed）", id), s["status"] == "committed")
+	}
+	if _, err := os.Stat(filepath.Join(work, "diff-restore-intact")); os.IsNotExist(err) {
+		rc, _ := raw("POST", srv.URL+fmt.Sprintf("/v1/snapshots/%d/restore", diffID2),
+			map[string]any{"target": filepath.Join(work, "diff-restore-intact")})
+		check("④未受损坏影响的原快照恢复能力不变", rc == http.StatusCreated)
+	}
+
 	// final listing
 	section(0, "快照总览")
 	list := get(srv.URL + "/v1/snapshots")["snapshots"].([]any)
@@ -303,12 +437,18 @@ func startServer(repoDir string) *httptest.Server {
 	must(err)
 	engine, err := backup.NewEngine(manifest, store)
 	must(err)
+	diffs := backup.NewDiffService(engine)
 	if recovered, err := engine.RecoverPending(); err == nil {
 		for _, r := range recovered {
 			fmt.Printf("  [启动恢复] 快照 %d -> %s\n", r.SnapshotID, r.Status)
 		}
 	}
-	return httptest.NewServer((&api.Server{Engine: engine}).NewRouter())
+	if resumed, err := diffs.RecoverInterrupted(); err == nil {
+		for _, id := range resumed {
+			fmt.Printf("  [启动恢复] 比较 %d 继续执行\n", id)
+		}
+	}
+	return httptest.NewServer((&api.Server{Engine: engine, Diff: diffs}).NewRouter())
 }
 
 func post(url string, body any) map[string]any {
@@ -366,6 +506,45 @@ func hashFile(p string) (string, int64) {
 	n, err := io.Copy(h, f)
 	must(err)
 	return hex.EncodeToString(h.Sum(nil)), n
+}
+
+// waitDiff polls a diff job until it reaches a terminal state.
+func waitDiff(base string, id int64) map[string]any {
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		doc := get(base + fmt.Sprintf("/v1/diffs/%d", id))
+		switch doc["status"] {
+		case "complete", "failed":
+			return doc
+		}
+		if time.Now().After(deadline) {
+			out, _ := json.MarshalIndent(doc, "", "  ")
+			must(fmt.Errorf("diff %d never finished: %s", id, out))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// newestBlob returns the most recently modified chunk blob under root. In the
+// demo it identifies a brand-new chunk written by the latest snapshot so the
+// storage-rot drill can delete precisely it.
+func newestBlob(root string) string {
+	var newest string
+	var newestMT time.Time
+	err := filepath.Walk(root, func(p string, info os.FileInfo, err error) error {
+		if err != nil || info.IsDir() {
+			return nil
+		}
+		if newest == "" || info.ModTime().After(newestMT) {
+			newest, newestMT = p, info.ModTime()
+		}
+		return nil
+	})
+	must(err)
+	if newest == "" {
+		must(fmt.Errorf("no chunk blobs found under %s", root))
+	}
+	return newest
 }
 
 func section(n int, title string) {

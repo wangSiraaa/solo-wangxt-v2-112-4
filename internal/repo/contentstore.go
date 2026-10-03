@@ -182,6 +182,28 @@ func bytesEqual(a, b []byte) bool {
 // IsBadDigest reports whether err is a content-digest verification failure.
 func IsBadDigest(err error) bool { return errors.Is(err, errBadDigest) }
 
+// VerifyDigest streams the blob named by id from disk and recomputes its
+// SHA-256. It returns whether the live digest matches id together with the
+// actual digest, so callers (the diff report) can name precisely what is on
+// disk when a blob has been corrupted.
+func (s *ContentStore) VerifyDigest(id []byte) (matches bool, actual []byte, err error) {
+	p, err := s.path(id)
+	if err != nil {
+		return false, nil, err
+	}
+	f, err := os.Open(p)
+	if err != nil {
+		return false, nil, err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return false, nil, err
+	}
+	sum := h.Sum(nil)
+	return bytesEqual(sum, id), sum, nil
+}
+
 // joinSafe joins root with a relative manifest path and guarantees the
 // result stays within root. Symlinks along the path are handled separately by
 // callers (they are never followed during restore), this is a lexical check.

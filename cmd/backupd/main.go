@@ -45,6 +45,7 @@ func main() {
 	if err != nil {
 		log.Fatalf("engine: %v", err)
 	}
+	diffs := backup.NewDiffService(engine)
 
 	// A hard crash between scan and commit leaves pending rows; reconcile
 	// them on startup so maintenance sees a definitive verdict.
@@ -55,13 +56,22 @@ func main() {
 			log.Printf("startup recovery: snapshot %d -> %s", r.SnapshotID, r.Status)
 		}
 	}
+	// Interrupted diff comparisons resume where they stopped (already-verified
+	// blocks are not re-read); input snapshots are never modified.
+	if resumed, err := diffs.RecoverInterrupted(); err != nil {
+		log.Printf("startup diff recovery: %v", err)
+	} else {
+		for _, id := range resumed {
+			log.Printf("startup diff recovery: resuming diff %d", id)
+		}
+	}
 
 	ln, err := net.Listen("tcp", *addr)
 	if err != nil {
 		log.Fatalf("listen %s: %v", *addr, err)
 	}
 	srv := &http.Server{
-		Handler:           (&api.Server{Engine: engine}).NewRouter(),
+		Handler:           (&api.Server{Engine: engine, Diff: diffs}).NewRouter(),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	log.Printf("backupd listening on http://%s (repo=%s)", ln.Addr(), abs)

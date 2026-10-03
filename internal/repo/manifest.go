@@ -120,6 +120,74 @@ CREATE TABLE IF NOT EXISTS meta (
 	key   TEXT PRIMARY KEY,
 	value TEXT NOT NULL
 );
+
+-- Persisted diff comparisons. A (base_snapshot_id, target_snapshot_id) pair is
+-- unique: repeating the same request always returns the same traceable report.
+-- Jobs survive process restarts; status queued/running is recovered and
+-- resumed. Diffing never mutates the two input snapshots.
+CREATE TABLE IF NOT EXISTS diff_jobs (
+	id               INTEGER PRIMARY KEY AUTOINCREMENT,
+	base_snapshot_id   INTEGER NOT NULL REFERENCES snapshots(id),
+	target_snapshot_id INTEGER NOT NULL REFERENCES snapshots(id),
+	status           TEXT    NOT NULL,            -- queued | running | complete | failed
+	complete         INTEGER NOT NULL DEFAULT 0, -- 1 once classification was stored
+	complete_at      TEXT,
+	error            TEXT    NOT NULL DEFAULT '',
+	chunks_total     INTEGER NOT NULL DEFAULT 0, -- distinct blobs to verify across both snapshots
+	chunks_checked   INTEGER NOT NULL DEFAULT 0, -- blobs whose live SHA-256 was verified
+	chunks_reused    INTEGER NOT NULL DEFAULT 0, -- target file chunks also present in the base snapshot
+	chunks_new       INTEGER NOT NULL DEFAULT 0, -- target file chunks absent from the base snapshot
+	chunks_missing   INTEGER NOT NULL DEFAULT 0, -- missing catalog row / blob / wrong length
+	chunks_mismatch  INTEGER NOT NULL DEFAULT 0, -- blob present but digest does not match
+	affected_files   INTEGER NOT NULL DEFAULT 0, -- entries that participate with a bad reference
+	created_at       TEXT    NOT NULL,
+	started_at       TEXT,
+	updated_at       TEXT    NOT NULL,
+	UNIQUE (base_snapshot_id, target_snapshot_id)
+);
+
+-- One classification row per (job, base path, target path). Every entry of
+-- either snapshot appears exactly once; change_type says what happened.
+CREATE TABLE IF NOT EXISTS diff_items (
+	job_id        INTEGER NOT NULL REFERENCES diff_jobs(id) ON DELETE CASCADE,
+	base_path     TEXT    NOT NULL DEFAULT '',
+	target_path   TEXT    NOT NULL DEFAULT '',
+	entry_kind    TEXT    NOT NULL,                  -- file | dir | symlink
+	change_type   TEXT    NOT NULL,                  -- added | deleted | changed | metadata_changed
+	                                                 -- | unchanged | renamed | ambiguous | unverified
+	changed_fields TEXT   NOT NULL DEFAULT '',       -- comma-separated: kind,mode,uid,gid,mtime,link_target
+	file_digest   TEXT    NOT NULL DEFAULT '',       -- hex, target digest for content comparison
+	chunks_reused INTEGER NOT NULL DEFAULT 0,
+	chunks_new    INTEGER NOT NULL DEFAULT 0,
+	integrity     TEXT    NOT NULL DEFAULT 'ok',     -- ok | affected (a referenced blob is bad)
+	detail        TEXT    NOT NULL DEFAULT '',       -- JSON extras (e.g. ambiguous candidates)
+	PRIMARY KEY (job_id, base_path, target_path)
+);
+
+-- Missing / digest-mismatched chunks discovered while preparing a diff. These
+-- are diagnoses only: they never alter either input snapshot.
+CREATE TABLE IF NOT EXISTS diff_problems (
+	id          INTEGER PRIMARY KEY AUTOINCREMENT,
+	job_id      INTEGER NOT NULL REFERENCES diff_jobs(id) ON DELETE CASCADE,
+	snapshot_id INTEGER NOT NULL,
+	rel_path    TEXT    NOT NULL DEFAULT '',
+	kind        TEXT    NOT NULL,        -- missing | digest_mismatch
+	chunk_digest TEXT   NOT NULL DEFAULT '',
+	declared_length INTEGER NOT NULL DEFAULT 0,
+	actual_digest   TEXT    NOT NULL DEFAULT '',
+	reason      TEXT    NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_diffprob_job ON diff_problems(job_id);
+
+-- Already-verified blobs of one diff job. Resuming after an interruption skips
+-- these so verification is incremental and the whole blob set is read at most
+-- once per job.
+CREATE TABLE IF NOT EXISTS diff_chunk_checks (
+	job_id     INTEGER NOT NULL REFERENCES diff_jobs(id) ON DELETE CASCADE,
+	chunk_digest BLOB  NOT NULL,
+	state      TEXT    NOT NULL,        -- ok | missing | digest_mismatch
+	PRIMARY KEY (job_id, chunk_digest)
+);
 `
 
 func (m *Manifest) migrate() error {

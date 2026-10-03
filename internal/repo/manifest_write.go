@@ -2,6 +2,7 @@ package repo
 
 import (
 	"database/sql"
+	"errors"
 	"fmt"
 	"time"
 )
@@ -299,4 +300,17 @@ func (m *Manifest) ChunkRowExists(digest []byte) (bool, error) {
 	var n int
 	err := m.db.QueryRow(`SELECT count(*) FROM chunks WHERE digest = ?`, digest).Scan(&n)
 	return n > 0, err
+}
+
+// ChunkLength returns the catalog-declared length of a chunk, ok=false when no
+// row exists (a reference to it is unsatisfiable regardless of the blob).
+func (m *Manifest) ChunkLength(digest []byte) (length int64, ok bool, err error) {
+	err = m.db.QueryRow(`SELECT length FROM chunks WHERE digest = ?`, digest).Scan(&length)
+	if errors.Is(err, sql.ErrNoRows) {
+		return 0, false, nil
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	return length, true, nil
 }
